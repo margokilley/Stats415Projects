@@ -1,0 +1,581 @@
+---
+title: "final_project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Basic Part
+
+###2.1 Backward returns
+
+```{r}
+prices = read.csv('final_project-1.csv')
+head(prices)
+```
+
+```{r}
+# Convert times from range 0 -> T - 1 to 1 -> T
+prices[, 1] = prices[, 1] + 1
+summary(prices)
+```
+
+```{r}
+I = c(1, 2, 3)
+H = c(3, 10, 30)
+
+BRs = matrix(nrow=nrow(prices), ncol=length(I)*length(H))
+```
+
+```{r}
+col_num = 1
+col_names = rep(0, length(I)*length(H))
+
+# Calculate backwards returns on each Asset
+for(i in I) {
+  asset_prices = prices[, i+1]
+  
+  # h-minute backward returns
+  for(h in H) {
+    # [s(t) - s(max(t - h), 1)] / s(max(t - h), 1)
+    prev_returns = asset_prices[pmax(prices[, 1] - h, 1)]
+    returns = round((asset_prices - prev_returns) / prev_returns, 4)
+    BRs[, col_num] = returns
+    
+    col_names[col_num] = paste("Asset_",i,"_BRet_",h, sep="")
+    col_num = col_num + 1
+  }
+}
+```
+
+```{r}
+# Output to bret.csv
+BRet = data.frame(BRs)
+colnames(BRet) <- col_names
+write.csv(BRet, 'bret.csv', row.names = FALSE)
+```
+
+### 2.2 Rolling correlation
+
+```{r}
+Rho_m = matrix(nrow=nrow(BRet), ncol=length(I))
+```
+
+```{r}
+# 3 weeks backward rolling correlation
+interval = 21 * 24 * 60
+
+col_num = 1
+col_names = rep(0, length(I))
+
+for (i in seq(1,3)) {
+  j = (i %% 3) + 1
+  
+  # Swap vars if i > j
+  if (i > j) { i = (j - i) + (j = i) }
+  
+  asset_i_BRet_3 = BRet[, (3 * i) - 2]
+  asset_j_BRet_3 = BRet[, (3 * j) - 2]
+  
+  rcor <- function(t) {
+    lower = max(t - interval, 1)
+  
+    return(round(cor(asset_i_BRet_3[lower:t], asset_j_BRet_3[lower:t]), 4))
+  }
+  
+  Rho_m[, col_num] <- mapply(rcor, prices[, 1])
+  col_names[col_num] = paste("Rho_", i, "_", j, sep="")
+  col_num = col_num + 1
+}
+```
+
+```{r}
+Rho <- data.frame(Rho_m)
+colnames(Rho) <- col_names
+write.csv(Rho, 'corr.csv', row.names = FALSE)
+```
+
+
+### 2.3 Linear Regression
+
+```{r}
+h = 10
+
+# Use asset 1 prices
+asset_prices = prices[, 2]
+
+# 
+future_returns = asset_prices[pmin(prices[, 1] + h, length(asset_prices))]
+returns = round((future_returns - asset_prices) / asset_prices, 4)
+
+FRet = data.frame("Asset_1_Fret_10"=returns)
+
+fret_bret <- cbind(FRet, BRet)
+```
+
+```{r}
+train_proportion = 0.7
+
+# Select first 70% of data as training data
+train_size <- floor(nrow(fret_bret) * train_proportion)
+train_ids = 1:train_size
+
+fret_train <- fret_bret[train_ids, ]
+fret_test <- fret_bret[-train_ids, ]
+
+fret_bret.lm <- lm(Asset_1_Fret_10 ~ ., data=fret_train)
+summary(fret_bret.lm)
+```
+
+The backward returns for Asset 2 and Asset 3 are significant in predicting the forward return of Asset 1 except for the 30-minute backwards returns for Asset 3.
+
+```{r}
+pred_train_lm = predict(fret_bret.lm, fret_train)
+pred_test_lm = predict(fret_bret.lm, fret_test)
+
+in_sample = cor(pred_train_lm, fret_train$Asset_1_Fret_10)
+out_sample = cor(pred_test_lm, fret_test$Asset_1_Fret_10)
+
+cat("In-sample correlation for regression:", in_sample,
+    "\nOut-sample correlation for regression:", out_sample)
+```
+
+```{r}
+# Plot three-week backward rolling correlation between predicted 
+# forward returns and actual forward returns
+
+ignore = library(roll)
+
+pred_lm = predict(fret_bret.lm, fret_bret)
+rcors_fb <- roll_cor(fret_bret$Asset_1_Fret_10, pred_lm, interval, min_obs = 1)
+
+plot(rcors_fb, main="Rolling 3-week backward correlation between actual and predicted 10 minute forward returns", xlab="Time t (minutes)", ylab="Correlation")
+```
+
+We observe the correlation structure to be approximately stationary over the year with mean correlation at around 0.05 and constant variance.
+
+
+### 2.4 KNN
+
+```{r}
+library(FNN)
+k_range = c(5, 25, 125, 625, 1000)
+
+trainMSE = c() 
+testMSE = c()
+
+# Test multiple values of K
+for (i in 1:length(k_range)) {
+    # Training MSE
+    knnTrain <- knn.reg(train = fret_train[, 2:10], y = fret_train[, 1],
+                        test = fret_train[, 2:10], k = k_range[i])
+    trainMSE[i] <- mean((fret_train[, 1] - knnTrain$pred)^2)
+    
+    # Test MSE
+    knnTest <- knn.reg(train = fret_train[, 2:10], y = fret_train[, 1],
+                       test = fret_test[, 2:10], k = k_range[i])
+    testMSE[i] <- mean((fret_test[, 1] - knnTest$pred)^2)
+}
+```
+
+```{r}
+plot(trainMSE ~ I(1/k_range), type="b", lwd = 2, col = "blue",
+     main = "Training and Test MSE for KNN", xlab = "1/K", 
+     ylab = "MSE", ylim=c(5e-6, 1e-5))
+lines(testMSE ~ I(1/k_range), type = "b", lwd = 2, col = "red")
+
+# Legend
+legend("bottomleft", legend =c("Training KNN", "Test KNN"), 
+       cex = 0.8, col =c("blue", "red"), lwd =c(2, 2), 
+       pch =c(1, 1), lty =c(1, 1))
+```
+
+```{r}
+best_k = k_range[which.min(testMSE)]
+
+# Generate predictions for the whole year with best K.
+# Last iteration in loop was for k = 1000
+knn_pred = c(knnTrain, knnTest)
+# plot(knn_pred$pred)
+
+knn_in_sample = cor(knnTrain$pred, fret_train$Asset_1_Fret_10)
+knn_out_sample = cor(knnTest$pred, fret_test$Asset_1_Fret_10)
+
+cat("In-sample correlation:", knn_in_sample,
+    "\nOut-sample correlation:", knn_out_sample)
+```
+
+
+### 2.5 Ridge and LASSO
+
+```{r}
+I = c(1, 2, 3)
+H = c(3, 10, 30, 60, 120, 180, 240, 360, 480, 600, 720, 960, 1200, 1440)
+
+BRs = matrix(nrow=nrow(prices), ncol=length(I)*length(H))
+```
+
+```{r}
+col_num = 1
+col_names = rep(0, length(I)*length(H))
+
+# Calculate backwards returns on each Asset
+for(i in I) {
+  asset_prices = prices[, i+1]
+  
+  # h-minute backward returns
+  for(h in H) {
+    # [s(t) - s(max(t - h), 1)] / s(max(t - h), 1)
+    prev_returns = asset_prices[pmax(prices[, 1] - h, 1)]
+    returns = round((asset_prices - prev_returns) / prev_returns, 4)
+    BRs[, col_num] = returns
+    
+    col_names[col_num] = paste("Asset_",i,"_BRet_",h, sep="")
+    col_num = col_num + 1
+  }
+}
+```
+
+```{r}
+BRet_ridge = data.frame(BRs)
+colnames(BRet_ridge) <- col_names
+
+FBret_ridge <- cbind(FRet, BRet_ridge)
+```
+
+```{r}
+library(glmnet)
+
+# Same training and testing samples as before
+FBret_x = model.matrix(Asset_1_Fret_10 ~ ., FBret_ridge)[, -1]
+FBret_y = FBret_ridge$Asset_1_Fret_10
+
+grid = 10^seq(2, -6, length=100)
+ridge.mod = glmnet(FBret_x[train_ids,], FBret_y[train_ids], alpha=0, lambda=grid)
+lasso.mod = glmnet(FBret_x[train_ids,], FBret_y[train_ids], alpha=1, lambda=grid)
+
+testMSEs_ridge = c()
+testMSEs_lasso = c()
+
+for (lam in grid) {
+  ridge_pred = predict(ridge.mod, s=lam, FBret_x[-train_ids, ])
+  testMSEs_ridge = c(testMSEs_ridge, mean((FBret_y[-train_ids] - ridge_pred)^2))
+  
+  lasso_pred = predict(lasso.mod, s=lam, FBret_x[-train_ids, ])
+  testMSEs_lasso = c(testMSEs_lasso, mean((FBret_y[-train_ids] - lasso_pred)^2))
+}
+```
+
+```{r}
+best_lam_ridge = grid[which.min(testMSEs_ridge)]
+best_lam_lasso = grid[which.min(testMSEs_lasso)]
+
+best_lam_ridge
+best_lam_lasso
+
+# Generate prediction for whole year
+ridge_pred = predict(ridge.mod, s=best_lam_ridge, FBret_x)
+lasso_pred = predict(lasso.mod, s=best_lam_lasso, FBret_x)
+```
+
+```{r}
+in_sample_ridge = cor(ridge_pred[train_ids], FBret_y[train_ids])
+out_sample_ridge = cor(ridge_pred[-train_ids], FBret_y[-train_ids])
+
+cat("In-sample correlation for ridge:", in_sample_ridge,
+    "\nOut-sample correlation for ridge:", out_sample_ridge)
+```
+
+```{r}
+in_sample_lasso = cor(lasso_pred[train_ids], FBret_y[train_ids])
+out_sample_lasso = cor(lasso_pred[-train_ids], FBret_y[-train_ids])
+
+cat("In-sample correlation for lasso:", in_sample_lasso,
+    "\nOut-sample correlation for lasso:", out_sample_lasso)
+```
+
+
+### 2.6 PCR
+
+```{r}
+library(pls)
+
+FR_pcr <- pcr(Asset_1_Fret_10 ~ ., data = FBret_ridge[train_ids, ], scale = FALSE, validation = "none")
+```
+
+```{r}
+summary(FR_pcr)
+```
+
+```{r}
+testMSEs_pcr = c()
+
+for(i in 1:(ncol(FBret_ridge)-1)) {
+  FR_pcr.pred <- predict(FR_pcr, FBret_ridge[-train_ids, ], ncomp = i)
+  PCRTestMSE <- mean((FR_pcr.pred - FBret_ridge[-train_ids, "Asset_1_Fret_10"])^2)
+  testMSEs_pcr = append(testMSEs_pcr, PCRTestMSE)
+}
+```
+
+```{r}
+which.min(testMSEs_pcr)
+
+# Generate predictions for the whole year
+FR_pcr.pred <- predict(FR_pcr, FBret_ridge, ncomp = which.min(testMSEs_pcr))
+
+in_sample_pcr = cor(FR_pcr.pred[train_ids], FBret_y[train_ids])
+out_sample_pcr = cor(FR_pcr.pred[-train_ids], FBret_y[-train_ids])
+
+cat("In-sample correlation for PCR:", in_sample_pcr,
+    "\nOut-sample correlation for PCR:", out_sample_pcr)
+```
+
+
+### 3 Advanced Part 
+
+```{r}
+interval = 24 * 60
+minutes = seq(1, interval)
+
+# -1 so we can have an actual value for the last predicted 10-min forward returns
+days = (nrow(prices) / interval) - 1
+
+H <- c(10, 30)
+I <- c(1, 2, 3)
+
+# H-min * I assets for forward returns, backward returns, and volatility
+# + 1 * interval for asset 1 prices t = [1, 1440], and + 1 for actual value
+# of 10-minute forward returns for the last minute of the day
+day_prices = matrix(nrow=days, ncol=((length(I)*(length(H)) + 2)*interval))
+```
+
+```{r}
+for (d in 1:days) {
+  col_num = 2
+  idxs = (d * interval) + minutes
+  
+  end = d * interval
+  f_ret = prices[end + 10, 2]
+  day_prices[d, 1] = round((f_ret - prices[end, 2])/ prices[end, 2], 4) 
+  
+  day_prices[d, col_num:(col_num + interval - 1)] = round(prices[idxs, 2], 4)
+  col_num = col_num + interval
+  
+  for (i in I) {
+    asset_prices = prices[idxs, i+1]
+    
+    for (h in H) {
+      prev_returns = asset_prices[pmax(minutes - h, 1)]
+      returns = round((asset_prices - prev_returns) / prev_returns, 4)
+      
+      day_prices[d, col_num:(col_num + interval - 1)] = returns
+      col_num = col_num + interval
+    }
+    
+    #for (h in H) {
+    #  forward_returns = asset_prices[pmin(minutes + h, interval)]
+    #  returns = round((forward_returns - asset_prices) / asset_prices, 4)
+      
+    #  day_prices[d, col_num:(col_num + interval - 1)] = returns
+    #  col_num = col_num + interval
+    #}
+    
+    # for (h in H) {
+    if (i == 1) {
+      for (j in 2:interval) {
+        day_prices[d, col_num] = round(sd(asset_prices[max(1, j - 9):j]), 4)
+        col_num = col_num + 1
+      }
+    }
+  }
+}
+```
+
+```{r}
+col_names = c("Asset_1_10-FRet_End")
+col_names = append(col_names, paste("Asset_1_Price_t", minutes, sep=""))
+
+for (i in I) {
+  for (h in H) {
+    col_names= append(col_names, paste("Asset_",i,"_",h,"-BRet_t", minutes, sep=""))
+  }
+  
+  #for (h in H) {
+  #  col_names = append(col_names, paste("Asset_",i,"_",h,"-FRet_t", minutes, sep=""))
+  #}
+  
+  # Exclude NA columns
+  if (i == 1) {
+    col_names = append(col_names, paste("Asset_",i,"_10-Vol_t", minutes[-1], sep=""))
+  }
+}
+```
+
+```{r}
+DayPrices = data.frame(day_prices)
+colnames(DayPrices) <- col_names
+# write.csv(DayPrices, 'day_prices.csv', row.names = FALSE)
+```
+
+```{r}
+set.seed(14532)
+train_proportion = 0.7
+
+# Select first 70% of data as training data
+train_size <- floor(nrow(DayPrices) * train_proportion)
+train_ids = 1:train_size
+
+prices_train <- DayPrices[train_ids, ]
+prices_test <- DayPrices[-train_ids, ]
+
+# options("expressions"=5e5)
+# mem = memory.limit(size=16000000)
+
+train_mat = model.matrix(`Asset_1_10-FRet_End` ~ ., data=prices_train)
+test_mat = model.matrix(`Asset_1_10-FRet_End` ~ ., data=prices_test)
+```
+
+
+```{r}
+library(glmnet)
+
+cv.ridge = cv.glmnet(train_mat, prices_train$`Asset_1_10-FRet_End`, alpha=0, nfolds=10)
+ridge.mod = glmnet(train_mat, prices_train$`Asset_1_10-FRet_End`, alpha=0)
+```
+
+```{r}
+bestlam_ridge = cv.ridge$lambda.min
+
+ridge.pred_train = predict(cv.ridge, s=bestlam_ridge, newx=train_mat)
+ridge.pred_test = predict(cv.ridge, s=bestlam_ridge, newx=test_mat)
+
+in_sample_adv_ridge = cor(ridge.pred_train, prices_train$`Asset_1_10-FRet_End`)
+out_sample_adv_ridge = cor(ridge.pred_test, prices_test$`Asset_1_10-FRet_End`)
+  
+cat("In-sample correlation for advanced ridge:", in_sample_adv_ridge,
+  "\nOut-sample correlation for advanced ridge:", out_sample_adv_ridge)
+```
+
+
+```{r}
+cv.lasso = cv.glmnet(train_mat, prices_train$`Asset_1_10-FRet_End`, alpha=1, nfolds=10)
+lasso.mod = glmnet(train_mat, prices_train$`Asset_1_10-FRet_End`, alpha=1)
+```
+
+```{r}
+bestlam_lasso = cv.lasso$lambda.min
+
+### returns nonzero coefs
+rownames(coef(cv.lasso, s = 'lambda.min'))[coef(cv.lasso, s = 'lambda.min')[,1]!= 0]
+
+lasso.pred_train = predict(cv.lasso, s=bestlam_lasso, newx=train_mat)
+lasso.pred_test = predict(cv.lasso, s=bestlam_lasso, newx=test_mat)
+
+in_sample_adv_lasso = cor(lasso.pred_train, prices_train$`Asset_1_10-FRet_End`)
+out_sample_adv_lasso = cor(lasso.pred_test, prices_test$`Asset_1_10-FRet_End`)
+  
+cat("In-sample correlation for advanced ridge:", in_sample_adv_lasso,
+    "\nOut-sample correlation for advanced ridge:", out_sample_adv_lasso)
+```
+
+```{r}
+library(pls)
+
+cv.pcr <- pcr(`Asset_1_10-FRet_End` ~ ., data=DayPrices, 
+              subset = train_ids, validation = "CV")
+validationplot(cv.pcr, val.type = "MSEP", legendpos = "topright")
+```
+
+```{r}
+cverr <- RMSEP(cv.pcr)$val[1,,]
+ncomp_min <- unname(which.min(cverr) - 1)
+
+pcr.pred_train = predict(cv.pcr, DayPrices[train_ids, ], ncomp = ncomp_min)
+pcr.pred_test = predict(cv.pcr, DayPrices[-train_ids, ], ncomp = ncomp_min)
+
+in_sample_adv_pcr = cor(pcr.pred_train, prices_train$`Asset_1_10-FRet_End`)
+out_sample_adv_pcr = cor(pcr.pred_test, prices_test$`Asset_1_10-FRet_End`)
+  
+cat("In-sample correlation for advanced PCR:", in_sample_adv_pcr,
+  "\nOut-sample correlation for advanced PCR:", out_sample_adv_pcr)
+```
+
+
+
+```{r}
+new_prices = matrix(nrow=1, ncol=((length(I)*(length(H)) + 2)*interval))
+
+prediction <- function(asset_prices) {
+  col_num = 2
+  new_prices[1, col_num:(col_num + interval - 1)] = round(asset_prices[minutes, 2], 4)
+  col_num = col_num + interval
+  
+  for (i in I) {
+    for (h in H) {
+      prev_returns = asset_prices[pmax(minutes - h, 1), i]
+      returns = round((asset_prices[, i] - prev_returns) / prev_returns, 4)
+      
+      new_prices[1, col_num:(col_num + interval - 1)] = returns
+      col_num = col_num + interval
+    }
+    
+    if (i == 1) {
+      for (j in 2:interval) {
+        new_prices[1, col_num] = round(sd(asset_prices[max(1, j - 9):j, i]), 4)
+        col_num  = col_num + 1
+      }
+    }
+  }
+  
+  return(unname(predict(cv.lasso, s=bestlam_lasso, newx=new_prices)[1,]))
+}
+```
+
+```{r}
+vals = c()
+
+options(digits.secs=6)
+start_time = Sys.time()
+
+for (i in 1:10000) {
+  vals = c(vals, prediction(prices[1:1440, 2:4]))
+}
+
+end_time = Sys.time()
+```
+
+```{r}
+temp = prices[, 2]
+prices[, 2] = prices[, 4]
+prices[, 4] = temp
+```
+
+```{r}
+interval = 24 * 60
+minutes = seq(1, interval)
+
+# -1 so we can have an actual value for the last predicted 10-min forward returns
+days = (nrow(prices) / interval) - 1
+
+H <- c(10, 30)
+I <- c(1, 2, 3)
+
+predicted_returns = c()
+expected_returns = c()
+
+for (d in 1:days) {
+  idxs = (d * interval) + minutes
+  
+  # Expected value
+  end = d * interval
+  f_ret = prices[end + 10, 2]
+  expected_returns[d] = round((f_ret - prices[end, 2])/ prices[end, 2], 4) 
+  
+  # Predicted value
+  predicted_returns[d] = prediction(prices[idxs, 2:4])
+}
+
+pred_cor = cor(expected_returns, predicted_returns)
+```
